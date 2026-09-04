@@ -1,0 +1,6 @@
+interface:
+  display_name: "ChatGPT Bridge"
+  short_description: "Delegate bounded research to signed-in ChatGPT Web via attach-only CDP bridge"
+  default_prompt: "Use $chatgpt-bridge to delegate a bounded, source-grounded research task to ChatGPT Web."
+policy:
+  allow_implicit_invocation: true
