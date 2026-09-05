@@ -26,7 +26,7 @@ Chrome CDP bridge. No API keys, no cookies handling, no second browser controlle
    & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.chrome-chatgpt-bridge"
    ```
 2. `npx` (Node.js) in `PATH`.
-3. Python 3.10+ with the tested SDK: `pip install "mcp==1.12.2"`
+3. Python 3.10+ with the tested SDK: `pip install "mcp==1.12.2" "websockets>=15.0.1"`
    (MCP Python SDK v2 compatibility is unverified).
 4. A ChatGPT account/workspace whose picker actually exposes the requested
    GPT-5.6 Sol + High state — otherwise the model gate will (correctly) refuse.
@@ -97,10 +97,13 @@ Full workflow, safety rules, binding policy, and report contract live in
 - `$chatgpt-web-research` is a documentation alias only; the installable skill
   name is `chatgpt-bridge`.
 - Fixed in this tree (kept here as behavior notes): non-positive `send`/batch
-  timeouts are rejected before any side effect; `send`/`upload` re-check the
-  exact bound URL immediately before acting (`conversation_moved`); `send`
-  fills the composer through the trusted editing path so ProseMirror registers
-  it; caller-side errors surface with exact codes before the MCP session opens.
+  timeouts are rejected before any side effect; `send` re-checks tab id, exact
+  URL, exact composer text, and a live send control in one final phase before
+  clicking (`composer_changed`/`conversation_moved`); `upload_file` is preceded
+  by a fresh exact-page check per file; landing-without-`--new-conversation`
+  and foreign URLs fail pre-session; `send` fills the composer through the
+  trusted editing path so ProseMirror registers it; caller-side errors surface
+  with exact codes before the MCP session opens.
 - Still caller-asserted: `--auto-save-report` / `save-report --status valid`
   records your verification claim. A stable response does not prove the model
   stayed on Sol + High — re-check visible model state after the response, and

@@ -4,7 +4,9 @@ Run:  python3 tests/test_bridge_pure.py   (needs Python 3.10+)
 """
 
 import argparse
+import asyncio
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -72,11 +74,17 @@ def make_ns(**overrides):
     return argparse.Namespace(**base)
 
 
-print("== squashed ==")
-check("collapses newlines", bridge.squashed("a\n\nb") == "a b")
-check("trims", bridge.squashed("  x  ") == "x")
-check("empty stays empty", bridge.squashed("") == "")
-check("cjk kept", bridge.squashed("兼职\n 项目") == "兼职 项目")
+print("== normalized_text ==")
+check("single newline kept", bridge.normalized_text("a\nb") == "a\nb")
+check("blank line kept", bridge.normalized_text("a\n\nb") == "a\n\nb")
+check("3+ newlines collapse", bridge.normalized_text("a\n\n\n\nb") == "a\n\nb")
+check("crlf normalized", bridge.normalized_text("a\r\nb") == "a\nb")
+check("nbsp normalized", bridge.normalized_text("a b") == "a b")
+check("trailing spaces stripped", bridge.normalized_text("a   \nb\t") == "a\nb")
+check("edge blanks stripped", bridge.normalized_text("\n\na\n\n") == "a")
+check("cjk kept", bridge.normalized_text("兼职\n项目") == "兼职\n项目")
+check("leading indent kept", bridge.normalized_text("兼职\n  项目") == "兼职\n  项目")
+check("code indent kept", bridge.normalized_text("def f():\n    return 1") == "def f():\n    return 1")
 
 print("== canonical_conversation_url ==")
 check("strips query", bridge.canonical_conversation_url("https://chatgpt.com/c/abc?messageId=x") == "https://chatgpt.com/c/abc")
@@ -149,11 +157,99 @@ with tempfile.TemporaryDirectory() as tmp:
         check("batch empty message rejected", False)
     except ValueError as e:
         check("batch empty message rejected", "non-empty" in str(e))
+    ns = make_ns(operation="send", message_file=msg, conversation_url="https://chatgpt.com/", new_conversation=False)
+    try:
+        bridge.preflight_args(ns)
+        check("send landing-without-new rejected", False)
+    except RuntimeError as e:
+        check("send landing-without-new rejected", "conversation_url_unavailable" in str(e))
+    ns = make_ns(operation="wait", conversation_url="https://chatgpt.com/c/abc", timeout=-1)
+    try:
+        bridge.preflight_args(ns)
+        check("wait negative rejected", False)
+    except ValueError as e:
+        check("wait negative rejected", "non-negative" in str(e))
+
+print("== node_version_ok ==")
+if shutil.which("node"):
+    check("real node ok", bridge.node_version_ok(shutil.which("node"))[0] is True)
+else:
+    print("  skip: real node (not installed)")
+with tempfile.TemporaryDirectory() as tmp2:
+    fake18 = Path(tmp2) / "node"
+    fake18.write_text("#!/bin/sh\necho v18.17.0\n", encoding="utf-8")
+    fake18.chmod(0o755)
+    ok18, detail18 = bridge.node_version_ok(str(fake18))
+    check("node 18 rejected", ok18 is False and "18" in detail18)
+    fake20 = Path(tmp2) / "node20"
+    fake20.write_text("#!/bin/sh\necho v20.19.0\n", encoding="utf-8")
+    fake20.chmod(0o755)
+    check("node 20.19 ok", bridge.node_version_ok(str(fake20))[0] is True)
+    check("missing node", bridge.node_version_ok(None) == (False, "node not in PATH"))
+    check("websockets present here", bridge.websockets_available() is True)
 
 print("== composer_insert_script escaping ==")
 tricky = 'quote " backslash \\ newline\n cjk 兼职 <tag>'
 script = bridge.composer_insert_script(tricky)
 check("json literal embedded", json.dumps(tricky, ensure_ascii=False) in script)
 check("no raw interpolation", "<tag>" in script)  # inside JSON string only
+
+print("== require_selected_page (mock session) ==")
+
+
+def _mock_session(pages):
+    class FakeSession:
+        pass
+
+    async def fake_call_tool(session, name, arguments=None):
+        assert name == "list_pages", f"unexpected tool {name}"
+        return ("", {"pages": pages})
+
+    return FakeSession(), fake_call_tool
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+_chat = {"id": 7, "url": "https://chatgpt.com/c/abc", "selected": True}
+_landing = {"id": 3, "url": "https://chatgpt.com/", "selected": True}
+_other = {"id": 9, "url": "https://chatgpt.com/c/other", "selected": True}
+
+_orig_call_tool = bridge.call_tool
+try:
+    conv_ns = make_ns(operation="send", conversation_url="https://chatgpt.com/c/abc")
+    landing_ns = make_ns(operation="send", conversation_url="https://chatgpt.com/", new_conversation=True)
+
+    bridge.call_tool = lambda s, n, a=None: _mock_session([_chat])[1](s, n, a)
+    cur = _run(bridge.require_selected_page(None, conv_ns, 7))
+    check("exact match passes", cur["id"] == 7)
+
+    bridge.call_tool = lambda s, n, a=None: _mock_session([_other])[1](s, n, a)
+    try:
+        _run(bridge.require_selected_page(None, conv_ns, 9))
+        check("moved tab refused", False)
+    except RuntimeError as e:
+        check("moved tab refused", "conversation_moved" in str(e))
+
+    bridge.call_tool = lambda s, n, a=None: _mock_session([_landing])[1](s, n, a)
+    cur = _run(bridge.require_selected_page(None, landing_ns, 3))
+    check("landing first-bind passes", cur["id"] == 3)
+
+    bridge.call_tool = lambda s, n, a=None: _mock_session([_other])[1](s, n, a)
+    try:
+        _run(bridge.require_selected_page(None, landing_ns, 9))
+        check("landing navigated away refused", False)
+    except RuntimeError as e:
+        check("landing navigated away refused", "conversation_moved" in str(e))
+
+    bridge.call_tool = lambda s, n, a=None: _mock_session([])[1](s, n, a)
+    try:
+        _run(bridge.require_selected_page(None, conv_ns, 7))
+        check("no selected tab refused", False)
+    except RuntimeError as e:
+        check("no selected tab refused", "conversation_moved" in str(e))
+finally:
+    bridge.call_tool = _orig_call_tool
 
 print(f"\nALL {PASS} CHECKS PASSED")

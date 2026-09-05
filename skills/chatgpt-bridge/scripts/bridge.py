@@ -7,8 +7,10 @@ import argparse
 import asyncio
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
+import subprocess
 import re
 import shutil
 import sys
@@ -1445,7 +1447,9 @@ def composer_insert_script(message: str) -> str:
     expected = json.dumps(message, ensure_ascii=False)
     return f"""() => {{
   const expected = {expected};
-  const squash = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+  const norm = (v) => String(v || '').replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ')
+    .split('\n').map((l) => l.replace(/[ \t]+$/, '')).join('\n')
+    .replace(/^\n+|\n+$/g, '').replace(/\n{3,}/g, '\n\n');
   const el = document.querySelector('#prompt-textarea')
     || document.querySelector('[role="textbox"][contenteditable="true"]');
   if (!el) return {{ok: false, reason: 'composer_not_found'}};
@@ -1461,7 +1465,7 @@ def composer_insert_script(message: str) -> str:
   try {{ execOk = document.execCommand('insertText', false, expected); }} catch (_) {{ execOk = false; }}
   try {{ el.dispatchEvent(new InputEvent('input', {{bubbles: true, cancelable: true}})); }} catch (_) {{}}
   const text = el.innerText;
-  return {{ok: true, exec_ok: !!execOk, matched: text.length > 0 && squash(text) === squash(expected), text_len: text.length}};
+  return {{ok: true, exec_ok: !!execOk, matched: text.length > 0 && norm(text) === norm(expected), text_len: text.length}};
 }}"""
 
 
@@ -1765,9 +1769,35 @@ async def wait_for_send_control_or_submission(
     )
 
 
-def squashed(value: Any) -> str:
-    """Collapse whitespace runs so DOM-rendered text compares equal to source."""
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+def normalized_text(value: Any) -> str:
+    """Canonicalize text while preserving meaningful line boundaries.
+
+    Normalizes CRLF/CR, NBSP, and trailing spaces, strips leading/trailing
+    blank lines, and collapses runs of 3+ newlines to exactly one blank
+    line. Single newlines (code, soft breaks) stay distinct from paragraph
+    breaks, so formatting-damaged content cannot compare equal.
+    """
+    text = (
+        str(value or "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\u00a0", " ")
+    )
+    lines = [re.sub(r"[ \t]+$", "", line) for line in text.split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    collapsed: list[str] = []
+    blank_run = False
+    for line in lines:
+        if line:
+            collapsed.append(line)
+            blank_run = False
+        elif not blank_run:
+            collapsed.append("")
+            blank_run = True
+    return "\n".join(collapsed)
 
 
 def canonical_conversation_url(url: str | None) -> str | None:
@@ -1841,6 +1871,34 @@ async def require_selected_page(
                 "acting; inspect before retry"
             )
     return current
+
+
+async def final_send_gate(
+    session: ClientSession,
+    args: argparse.Namespace,
+    page_id: int,
+    message: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One final phase before clicking Send: tab id + exact URL + exact
+    composer text + a currently visible send control. Anything stale refuses
+    with a distinct code instead of submitting wrong content."""
+    await require_selected_page(session, args, page_id)
+    snapshot = await take_page_snapshot(session, page_id)
+    state = await page_state(session, page_id, snapshot)
+    composer = state.get("composer")
+    text = composer_text(composer) if isinstance(composer, dict) else ""
+    if normalized_text(text) != normalized_text(message):
+        raise RuntimeError(
+            "composer_changed: composer content no longer matches the reviewed "
+            "message; inspect before retry"
+        )
+    send_button = find_send_button(snapshot)
+    if not send_button:
+        raise RuntimeError(
+            "send_control_unavailable: send control gone at final gate; "
+            "inspect before retry"
+        )
+    return send_button, state
 
 
 async def insert_composer_text(
@@ -2640,6 +2698,7 @@ async def upload_operation(
             target, proxy = await open_local_upload_target(
                 session, page_id, current_snapshot
             )
+            await require_selected_page(session, args, page_id)
             await call_tool(
                 session,
                 "upload_file",
@@ -2915,7 +2974,7 @@ async def send_operation(
     if not composer:
         raise RuntimeError("page_state_unreadable: composer uid was not found in snapshot")
     draft = composer_text(composer)
-    if draft and squashed(draft) != squashed(message):
+    if draft and normalized_text(draft) != normalized_text(message):
         raise RuntimeError(
             "composer_not_empty: refusing to overwrite an existing unsent draft"
         )
@@ -2933,7 +2992,8 @@ async def send_operation(
     )
     submission_observed = submission_started(initial_messages, latest_messages, message)
     if send_button and not submission_observed:
-        await require_selected_page(session, args, page_id)
+        send_button, latest = await final_send_gate(session, args, page_id, message)
+        latest_messages = await message_state(session, page_id)
         try:
             await call_tool(
                 session,
@@ -3077,10 +3137,10 @@ def preflight_args(args: argparse.Namespace) -> None:
     """Fail fast on caller-side errors before opening the MCP session.
 
     Errors raised inside the session can be masked by anyio task-group
-    teardown (a BrokenResourceError replaces the original), so every check
-    that does not need the browser runs here with the same error codes the
-    operations would raise. Timeouts are required positive here so a
-    non-positive value can never report failure after side effects.
+    teardown (a BrokenResourceError replaces the original), so confirm
+    flags, files, positive timeouts, dependency presence, and URL shapes
+    are checked here. Page-bound rules (selected tab, drafts, model state)
+    still require the live browser and stay in-session.
     """
     op = args.operation
     preflight_url_shape(args)
@@ -3097,6 +3157,15 @@ def preflight_args(args: argparse.Namespace) -> None:
             raise RuntimeError(
                 "conversation_url_unavailable: pass the exact bound URL, or "
                 "--new-conversation for the landing-page first bind"
+            )
+        if (
+            args.conversation_url
+            and is_landing_url(args.conversation_url)
+            and not args.new_conversation
+        ):
+            raise RuntimeError(
+                "conversation_url_unavailable: a landing page requires "
+                "--new-conversation for the first bind"
             )
         require_non_empty_message_file(args.message_file)
         if args.timeout <= 0:
@@ -3160,6 +3229,15 @@ def preflight_args(args: argparse.Namespace) -> None:
                 "conversation_url_unavailable: pass the exact bound URL, or "
                 "--new-conversation for the landing-page first bind"
             )
+        if (
+            args.conversation_url
+            and is_landing_url(args.conversation_url)
+            and not args.new_conversation
+        ):
+            raise RuntimeError(
+                "conversation_url_unavailable: a landing page requires "
+                "--new-conversation for the first bind"
+            )
         normalize_upload_files(args.file)
     elif op == "close-duplicates":
         if not args.confirm_close:
@@ -3174,6 +3252,10 @@ def preflight_args(args: argparse.Namespace) -> None:
         if not args.confirm_download:
             raise PermissionError(
                 "download_refused: use --confirm-download only after confirming the exact page and target"
+            )
+        if not websockets_available():
+            raise RuntimeError(
+                'download_unavailable: the websockets package is missing; run pip install "websockets>=15.0.1"'
             )
         if args.conversation_url is None or not is_conversation_url(args.conversation_url):
             raise ValueError(
@@ -3203,6 +3285,30 @@ def cdp_reachable(cdp_url: str | None) -> tuple[bool, str]:
     return True, str(info.get("Browser", "reachable"))
 
 
+def node_version_ok(node_bin: str | None) -> tuple[bool, str]:
+    """Check node against the pinned MCP server requirement (>=20.19, >=22.12, >=23)."""
+    if not node_bin:
+        return False, "node not in PATH"
+    try:
+        out = subprocess.run(
+            [node_bin, "--version"], capture_output=True, text=True, timeout=10
+        )
+    except Exception as exc:
+        return False, f"node --version failed: {exc}"
+    raw = (out.stdout or "").strip().lstrip("v")
+    parts = raw.split(".")
+    try:
+        major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return False, f"unparseable node version: {raw!r}"
+    ok = (major == 20 and minor >= 19) or (major == 22 and minor >= 12) or major >= 23
+    return ok, raw or "unknown"
+
+
+def websockets_available() -> bool:
+    return importlib.util.find_spec("websockets") is not None
+
+
 def doctor_local_checks(args: argparse.Namespace) -> list[dict[str, Any]]:
     """Interpreter, dependency, launcher, and CDP checks (no browser session)."""
     checks: list[dict[str, Any]] = []
@@ -3216,7 +3322,15 @@ def doctor_local_checks(args: argparse.Namespace) -> list[dict[str, Any]]:
     except importlib.metadata.PackageNotFoundError:
         record("mcp_sdk", False, 'missing: pip install "mcp==1.12.2" (tested)')
     node = shutil.which("node")
-    record("node", node is not None, node or "node not in PATH")
+    node_ok, node_detail = node_version_ok(node)
+    record("node", node_ok, node_detail or "node not in PATH")
+    record(
+        "websockets",
+        websockets_available(),
+        "present (needed only by download-attachments)"
+        if websockets_available()
+        else 'missing: pip install "websockets>=15.0.1" (needed only by download-attachments)',
+    )
     launcher = args.mcp_command if args.mcp_command != "npx" else "npx"
     launcher_detail = launcher
     if args.mcp_package_root:
@@ -3305,6 +3419,20 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "failed_count": failed,
             "mcp_session": "skipped: MCP SDK missing",
         }
+    if args.operation == "doctor":
+        # Local checks first so a broken launcher/CDP still yields a report
+        # instead of dying inside MCP startup.
+        local = {item["name"]: item for item in doctor_local_checks(args)}
+        if not local["mcp_launcher"]["ok"] or not local["cdp"]["ok"]:
+            checks = list(local.values())
+            failed = sum(1 for item in checks if not item["ok"])
+            return {
+                "operation": "doctor",
+                "checks": checks,
+                "passed_count": len(checks) - failed,
+                "failed_count": failed,
+                "mcp_session": "skipped: launcher or CDP unavailable",
+            }
     if not _MCP_SDK_AVAILABLE:
         raise RuntimeError(
             'mcp_sdk_missing: the MCP Python SDK is not installed; run pip install "mcp==1.12.2" '
