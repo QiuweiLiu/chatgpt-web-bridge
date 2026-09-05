@@ -41,6 +41,27 @@ Legacy alias: `$chatgpt-web-research`. New canonical trigger is `$chatgpt-bridge
    Prefer paths relative to this skill's own directory (the loader resolves
    skill-relative references); don't reconstruct `<repo>/...` absolute paths.
 
+## Environment (one venv per machine)
+
+The bridge needs exactly one interpreter with the repo-root
+`requirements.txt` installed. Conventional location: `~/.venvs/chatgpt-bridge`.
+Ensure-or-create on every fresh machine (idempotent — reuse when healthy,
+never create a second venv beside it):
+
+```sh
+VENV=~/.venvs/chatgpt-bridge
+if "$VENV/bin/python" -c "import mcp, websockets" 2>/dev/null; then
+  echo "reuse $VENV"
+else
+  python3 -m venv "$VENV" && "$VENV/bin/pip install -r <repo>/requirements.txt"
+fi
+```
+
+`python3` above means any 3.10+. Never `pip install` into a system or
+conda-base python to "fix" a doctor failure — fix (or recreate) the venv
+instead. Machine-specific absolute paths stay out of this repo; record the
+local choice in host config (e.g. opencode `AGENTS.md`), not here.
+
 Configure only via environment (see `references/env.md`); CLI flags override env:
 
 | Env | Default |

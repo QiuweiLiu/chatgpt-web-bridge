@@ -11,5 +11,9 @@ All settings are optional environment variables. CLI flags override them.
 
 Equivalent CLI flags: `--cdp-url`, `--mcp-command`, `--mcp-package`, `--mcp-package-root`, `--mcp-python`.
 
+Which interpreter: follow the skill's Environment section (one conventional
+venv per machine, reuse-when-healthy). The variables above only tune the
+bridge's behavior, never the interpreter choice.
+
 No cookies, tokens, `.env` files, or browser profiles are read or stored by this skill.
 Authentication always comes from your existing signed-in browser session.
