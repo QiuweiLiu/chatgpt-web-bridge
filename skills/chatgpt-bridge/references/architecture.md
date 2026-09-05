@@ -3,7 +3,7 @@
 Entry: `main()` → `build_parser()` → `run(args)` → per-operation `*_operation()`.
 
 ```
-CLI (argparse, 14 operations + --version)
+CLI (argparse operations + --version)
  │
  ├─ pre-session (no browser): preflight_args() — confirm flags, files,
  │   positive timeouts, dependency presence, URL shapes; save-report runs here
@@ -34,12 +34,20 @@ CLI (argparse, 14 operations + --version)
 6. **Transport** — `server_parameters()` (always `--browserUrl`, attach-only),
    `call_tool()` (bounded timeout), `error_message()` (TaskGroup unwrap).
 
-## Key invariants
+## Key invariants (current)
 
 - The bridge never launches or terminates Chrome; tabs may be opened/closed.
 - Nothing sends/uploads/downloads without action-time `--confirm-*`.
-- `send` final phase (single gate, no awaits inside): selected tab id →
-  exact URL → exact composer text (`normalized_text`, line-preserving) →
-  live send control → click.
+- `send` verifies selected tab id + exact URL + exact composer text
+  (`normalized_text`, line-preserving) + a live send control in
+  `final_send_gate()`; one `message_state()` refresh still sits between the
+  gate and the click (see v1.0 target below).
 - Briefs travel via `--message-file`, never CLI argv.
 - `save-report` / `export` / `download` require a `.project/` control plane.
+
+## v1.0 target invariants (not yet merged)
+
+- Single-phase final gate with no awaits between verification and click.
+- High/model state re-confirmed inside the final gate.
+- Message correlation (`user_message_matches`) unified on `normalized_text`
+  instead of whitespace-collapsed compare.

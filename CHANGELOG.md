@@ -5,7 +5,15 @@ Version identity also lives in code as `BRIDGE_VERSION` (`bridge.py --version`).
 
 ## [Unreleased] — toward v1.0.0
 
-Queued correctness gates (all specified, not yet merged).
+Queued correctness gates (specified, not yet merged): single-phase final
+send gate without awaits before click, High/model re-check inside the gate,
+unified line-preserving message correlation, doctor node-failure local-only
+path. These will move into the release notes only when merged.
+
+## [0.9.0] — 2026-09-05 (pre-release)
+
+First public, installable shape. Behavior below is what this tag contains;
+anything stronger lives in [Unreleased].
 
 ## [0.9.0] — 2026-09-05 (pre-release)
 
@@ -25,9 +33,10 @@ First public, installable shape.
 - Trusted composer fill (select-all + `insertText`) with legacy fallback.
 - Pre-session preflight: confirm flags, files, positive timeouts (including
   batch effective timeouts), dependency presence, URL shapes.
-- Exact-page guards (`conversation_moved`) before send clicks and each upload.
-- Final send gate: tab id + exact URL + exact composer text + live send
-  control verified in one phase before clicking.
+- Exact-page guards (`conversation_moved`) before send clicks and each upload;
+  the final gate re-verifies tab id, exact URL, composer text, and a live
+  send control, with one message-state refresh still preceding the click
+  (see [Unreleased]).
 - `tests/test_bridge_pure.py`: pure + mocked-guard checks, no browser needed.
 
 ### Security

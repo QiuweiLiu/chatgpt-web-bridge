@@ -9,8 +9,10 @@
 
 ## Reporting a Vulnerability
 
-**Do not open a public issue** for security reports. Contact the maintainer
-privately (see the repository owner profile) with:
+**Do not open a public issue** for security reports. Use the repository
+**Security tab → Report a vulnerability** (private). If that button is not
+available, contact the maintainer privately (see the repository owner
+profile) and mention this file. Either way, include:
 
 - affected version (`bridge.py --version`) and environment (`doctor` output
   with private paths redacted, see below);

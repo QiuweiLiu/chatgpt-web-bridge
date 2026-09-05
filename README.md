@@ -75,6 +75,12 @@ python3 skills/chatgpt-bridge/scripts/bridge.py --help
 mkdir -p ~/.agents/skills && cp -r skills/chatgpt-bridge ~/.agents/skills/
 # then quit and restart your host (configs/skills load once at startup)
 
+# reproducible install from a tagged release (dependencies travel with the skill)
+git clone https://github.com/QiuweiLiu/chatgpt-web-bridge.git
+cd chatgpt-web-bridge && git checkout v0.9.0
+python -m pip install -r requirements.txt
+mkdir -p ~/.agents/skills && cp -r skills/chatgpt-bridge ~/.agents/skills/
+
 # per-project (both hosts scan this too)
 mkdir -p ./.agents/skills && cp -r skills/chatgpt-bridge ./.agents/skills/
 
