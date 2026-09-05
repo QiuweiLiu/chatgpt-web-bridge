@@ -18,13 +18,27 @@ Legacy alias: `$chatgpt-web-research`. New canonical trigger is `$chatgpt-bridge
 
 ## Prerequisites (out-of-the-box)
 
-1. Chrome/Chromium running with a CDP endpoint, logged into ChatGPT in that instance:
+1. Google Chrome (or Chrome for Testing; other Chromiums best-effort) with a
+   **dedicated persistent profile**, signed into ChatGPT there once.
+   Chrome 136+ ignores `--remote-debugging-port` for the default data
+   directory, so pass a custom `--user-data-dir`; keep the port on loopback:
    ```sh
-   google-chrome --remote-debugging-port=9222
+   # macOS
+   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+     --remote-debugging-port=9222 --user-data-dir="$HOME/.chrome-chatgpt-bridge"
+   # Linux
+   google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.chrome-chatgpt-bridge"
+   # Windows (PowerShell)
+   & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.chrome-chatgpt-bridge"
    ```
 2. Node.js with `npx` in `PATH`.
-3. Python with the MCP client SDK: `pip install mcp`.
-4. This repo on disk. No install step, no cookies/tokens/`.env` needed.
+3. Python 3.10+ with the tested SDK: `pip install "mcp==1.12.2"`
+   (MCP SDK v2 compatibility unverified).
+4. A ChatGPT account/workspace whose picker actually exposes GPT-5.6 Sol +
+   High — otherwise the model gate will (correctly) refuse.
+5. This repo on disk. No install step, no cookies/tokens/`.env` needed.
+   Prefer paths relative to this skill's own directory (the loader resolves
+   skill-relative references); don't reconstruct `<repo>/...` absolute paths.
 
 Configure only via environment (see `references/env.md`); CLI flags override env:
 
@@ -67,6 +81,7 @@ before opening the browser.
 BRIDGE=<repo>/skills/chatgpt-bridge/scripts/bridge.py
 
 # 0. read-only preflight (always first)
+python3 "$BRIDGE" doctor
 python3 "$BRIDGE" inspect
 
 # 1. reopen the exact bound conversation (never guess by title/index/newest)
@@ -88,8 +103,10 @@ python3 "$BRIDGE" send --conversation-url "https://chatgpt.com/" \
   --new-conversation --message-file ./brief.txt --verified-high --confirm-send
 ```
 
-Other read-only ops: `list-conversations`, `switch-conversation`, `wait`,
-`export-conversation`, `download-attachments`. Guarded write ops:
+Truly read-only ops: `doctor`, `inspect`, `status`, `wait`,
+`list-conversations`. Navigation/file-writing ops: `new-page`,
+`switch-conversation`, `export-conversation`, `download-attachments`.
+Guarded write ops:
 `batch-send` (max 20, exact URLs, stop-on-first-error by default),
 `upload` (requires `--verified-high --confirm-upload`, never sends),
 `save-report` (writes `docs/research/YYYY-MM-DD_<topic>.md` or explicit
@@ -125,6 +142,12 @@ shows no restriction/limit/fallback warning. Do not accept `Instant`, `Medium`,
 `page_state_unreadable` / `page_load_failure` / `research_timeout` — never
 submit the brief unverified.
 
+First bind: `select-model` requires an exact `/c/...` conversation URL and
+refuses the landing page. Send first with `send --conversation-url
+https://chatgpt.com/ --new-conversation` (the visible-High + `--verified-high`
+gate applies), then run `select-model` on the returned exact URL for explicit
+verification.
+
 ## Brief + report contract
 
 Brief file shape (redacted, secret-safe):
@@ -151,19 +174,26 @@ never promote recommendations into canonical docs without local verification.
 
 ## Install
 
-opencode (global):
+Recommended (scanned by both current OpenCode and Codex):
+
 ```sh
-cp -r skills/chatgpt-bridge ~/.config/opencode/skills/
-# restart opencode (config is loaded once at startup)
+mkdir -p ~/.agents/skills && cp -r skills/chatgpt-bridge ~/.agents/skills/   # user-global
+mkdir -p ./.agents/skills && cp -r skills/chatgpt-bridge ./.agents/skills/   # per-project
+# then restart the host (skills load once at startup)
 ```
 
-opencode (per project) or codex project skills:
+Legacy alternatives:
+
 ```sh
-cp -r skills/chatgpt-bridge ./.opencode/skills/
-# or codex: cp -r skills/chatgpt-bridge ~/.codex/skills/
+cp -r skills/chatgpt-bridge ~/.config/opencode/skills/  # opencode-only global
+cp -r skills/chatgpt-bridge ~/.codex/skills/             # codex-only global (deprecated upstream)
 ```
 
 opencode (reference without copying) — add to `opencode.jsonc`:
 ```jsonc
 { "skills": { "paths": ["/absolute/path/to/chatgpt-bridge-skill/skills/chatgpt-bridge"] } }
 ```
+
+Per-host invocation differs: Codex uses `$chatgpt-bridge`; OpenCode exposes
+loaded skills through its own skill/command discovery — say
+"use the chatgpt-bridge skill" if `$`-invocation is unavailable.

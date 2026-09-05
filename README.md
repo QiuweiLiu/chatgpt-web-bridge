@@ -11,36 +11,51 @@ Chrome CDP bridge. No API keys, no cookies handling, no second browser controlle
 
 ## Prerequisites
 
-1. Chrome/Chromium with remote debugging, logged into ChatGPT there:
+1. Google Chrome (or Chrome for Testing; other Chromiums are best-effort) with a
+   **dedicated persistent profile** for automation, signed into ChatGPT there once.
+   Since Chrome 136, `--remote-debugging-port` is ignored for the default data
+   directory, so a custom `--user-data-dir` is required. Keep the port on
+   loopback; never expose 9222 beyond your machine:
    ```sh
-   google-chrome --remote-debugging-port=9222
+   # macOS
+   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+     --remote-debugging-port=9222 --user-data-dir="$HOME/.chrome-chatgpt-bridge"
+   # Linux
+   google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.chrome-chatgpt-bridge"
+   # Windows (PowerShell)
+   & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.chrome-chatgpt-bridge"
    ```
 2. `npx` (Node.js) in `PATH`.
-3. Python with `pip install mcp`.
-4. That's it. No `.env`, no tokens.
+3. Python 3.10+ with the tested SDK: `pip install "mcp==1.12.2"`
+   (MCP Python SDK v2 compatibility is unverified).
+4. A ChatGPT account/workspace whose picker actually exposes the requested
+   GPT-5.6 Sol + High state — otherwise the model gate will (correctly) refuse.
+5. That's it. No `.env`, no tokens.
 
 ## 30-second smoke test
 
 ```sh
+python3 skills/chatgpt-bridge/scripts/bridge.py doctor
 python3 skills/chatgpt-bridge/scripts/bridge.py inspect
 python3 skills/chatgpt-bridge/scripts/bridge.py --help
 ```
 
-`inspect`/`status`/`wait` are read-only. `new-page` opens ChatGPT without sending.
+`doctor`/`inspect`/`status`/`wait` are read-only. `new-page` opens ChatGPT without sending.
 `send`/`batch-send`/`upload` require explicit `--confirm-*` + `--verified-high`.
 
 ## Install
 
 ```sh
-# opencode, global
-cp -r skills/chatgpt-bridge ~/.config/opencode/skills/
-# then quit and restart opencode (config loads once at startup)
+# recommended: user-global, scanned by both current OpenCode and Codex
+mkdir -p ~/.agents/skills && cp -r skills/chatgpt-bridge ~/.agents/skills/
+# then quit and restart your host (configs/skills load once at startup)
 
-# opencode, per-project
-cp -r skills/chatgpt-bridge ./.opencode/skills/
+# per-project (both hosts scan this too)
+mkdir -p ./.agents/skills && cp -r skills/chatgpt-bridge ./.agents/skills/
 
-# codex
-cp -r skills/chatgpt-bridge ~/.codex/skills/
+# legacy alternatives
+cp -r skills/chatgpt-bridge ~/.config/opencode/skills/  # opencode-only global
+cp -r skills/chatgpt-bridge ~/.codex/skills/             # codex-only global (deprecated upstream)
 
 # opencode, reference without copying (opencode.jsonc)
 # { "skills": { "paths": ["/abs/path/to/chatgpt-bridge-skill/skills/chatgpt-bridge"] } }
@@ -63,8 +78,11 @@ Full workflow, safety rules, binding policy, and report contract live in
 
 ## Security model
 
-- Attach-only: the bridge never launches or closes Chrome.
+- Attach-only: the bridge never launches or terminates the Chrome process
+  (it can open/close tabs in the attached browser).
 - Auth = your existing browser session. The skill never reads/saves cookies, storage, or tokens.
+- CDP attachment is privileged by nature: use the dedicated automation profile
+  above, don't browse sensitive accounts in it, and keep port 9222 on loopback.
 - Briefs travel via `--message-file`, never CLI argv.
 - Uploads are explicit per-file (max 20), never directories/wildcards. Policy
   forbids secrets/`.env`/private source — enforced by the caller, not by a
@@ -72,23 +90,21 @@ Full workflow, safety rules, binding policy, and report contract live in
   already refused such files.
 - Every send/upload/download needs action-time `--confirm-*`.
 
-## Known limitations (inherited from upstream bridge behavior, v1 documents instead of forking)
+## Known limitations
 
-- Non-positive `--timeout` (`send --timeout 0`, batch item `timeout: 0`) still
-  performs fill/click before reporting `submission_unknown`. Always use a
-  positive timeout; never auto-retry an ambiguous submission without `status`.
-- `--auto-save-report` / `save-report --status valid` records caller-asserted
-  validity. A stable assistant response does not prove the model stayed on
-  Sol + High — re-check visible model state after the response before claiming
-  `valid`, and use `invalid`/`unverified` otherwise.
-- The bridge checks the page is still a ChatGPT conversation before side
-  effects, not that it is still the exact bound URL. Re-run `status
-  --conversation-url "$BOUND_URL"` immediately before `send`/`upload` if the
-  tab may have navigated.
 - `--mcp-package-root` mode falls back to `/usr/local/bin/node` when `node` is
   not in `PATH`; keep Node in `PATH` on Linux/Windows/Homebrew setups.
 - `$chatgpt-web-research` is a documentation alias only; the installable skill
   name is `chatgpt-bridge`.
+- Fixed in this tree (kept here as behavior notes): non-positive `send`/batch
+  timeouts are rejected before any side effect; `send`/`upload` re-check the
+  exact bound URL immediately before acting (`conversation_moved`); `send`
+  fills the composer through the trusted editing path so ProseMirror registers
+  it; caller-side errors surface with exact codes before the MCP session opens.
+- Still caller-asserted: `--auto-save-report` / `save-report --status valid`
+  records your verification claim. A stable response does not prove the model
+  stayed on Sol + High — re-check visible model state after the response, and
+  use `invalid`/`unverified` otherwise.
 
 ## License
 

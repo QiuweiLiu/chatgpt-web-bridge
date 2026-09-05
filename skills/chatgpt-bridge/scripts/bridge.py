@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -18,9 +19,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.types import ListRootsResult, Root
+try:
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+    from mcp.types import ListRootsResult, Root
+
+    _MCP_SDK_AVAILABLE = True
+except ImportError:
+    # Doctor must still report a missing SDK instead of crashing at import.
+    ClientSession = Any
+    StdioServerParameters = Any
+    stdio_client = None
+    ListRootsResult = Any
+    Root = Any
+    _MCP_SDK_AVAILABLE = False
 
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
@@ -63,12 +75,14 @@ def build_parser() -> argparse.ArgumentParser:
             "export-conversation",
             "download-attachments",
             "send",
+            "doctor",
         ),
         help=(
             "Read state, open a background page, read status, wait for completion, "
             "close duplicate target pages, select the model, list or switch conversations, "
             "run guarded batch sends, upload confirmed files, save a report, export a visible "
-            "conversation, download a confirmed attachment, or send a brief."
+            "conversation, download a confirmed attachment, send a brief, "
+            "or run a read-only environment check."
         ),
     )
     parser.add_argument(
@@ -568,7 +582,7 @@ def find_send_button(snapshot: dict[str, Any]) -> dict[str, Any] | None:
     for node in snapshot_nodes(snapshot, "button"):
         name = str(node.get("name", "")).strip()
         if re.search(
-            r"^(send|发送|提交)(?:\s*(prompt|message|消息|提示))?$",
+            r"^(send|发送|提交)(?:\s*(prompt|message|消息|訊息|提示(?:词)?))?$",
             name,
             re.IGNORECASE,
         ):
@@ -1427,6 +1441,30 @@ CONVERSATION_LIST_SCRIPT = r"""() => {
 }"""
 
 
+def composer_insert_script(message: str) -> str:
+    expected = json.dumps(message, ensure_ascii=False)
+    return f"""() => {{
+  const expected = {expected};
+  const squash = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+  const el = document.querySelector('#prompt-textarea')
+    || document.querySelector('[role="textbox"][contenteditable="true"]');
+  if (!el) return {{ok: false, reason: 'composer_not_found'}};
+  el.focus();
+  try {{
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }} catch (_) {{}}
+  let execOk = false;
+  try {{ execOk = document.execCommand('insertText', false, expected); }} catch (_) {{ execOk = false; }}
+  try {{ el.dispatchEvent(new InputEvent('input', {{bubbles: true, cancelable: true}})); }} catch (_) {{}}
+  const text = el.innerText;
+  return {{ok: true, exec_ok: !!execOk, matched: text.length > 0 && squash(text) === squash(expected), text_len: text.length}};
+}}"""
+
+
 def upload_state_script(filename: str) -> str:
     expected = json.dumps(filename, ensure_ascii=False)
     return f"""() => {{
@@ -1725,6 +1763,131 @@ async def wait_for_send_control_or_submission(
         "send_control_unavailable: no semantic send button or visible submission signal "
         f"after {POST_FILL_WAIT_SECONDS}s; refusing Enter fallback"
     )
+
+
+def squashed(value: Any) -> str:
+    """Collapse whitespace runs so DOM-rendered text compares equal to source."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def canonical_conversation_url(url: str | None) -> str | None:
+    """Strip query/fragment/trailing slash and lowercase scheme+host."""
+    if not url:
+        return url
+    base = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    if "://" in base:
+        scheme, _, rest = base.partition("://")
+        host, sep, path = rest.partition("/")
+        base = scheme.lower() + "://" + host.lower() + (sep + path if sep else "")
+    return base
+
+
+def require_exact_page(args: argparse.Namespace, actual_url: str | None) -> None:
+    """Refuse side effects when the tab is no longer the exact bound URL.
+
+    The page check above only guarantees "still a ChatGPT page"; without this,
+    a tab that navigated to a different /c/... would receive the send/upload.
+    """
+    requested = args.conversation_url
+    if (
+        requested is not None
+        and is_conversation_url(requested)
+        and canonical_conversation_url(actual_url)
+        != canonical_conversation_url(requested)
+    ):
+        raise RuntimeError(
+            "conversation_moved: the selected page is no longer the exact "
+            "bound URL; inspect before retry"
+        )
+
+
+async def require_selected_page(
+    session: ClientSession,
+    args: argparse.Namespace,
+    page_id: int | None = None,
+) -> dict[str, Any]:
+    """Re-read which tab is selected immediately before acting.
+
+    Compares both the tab id we are about to act on AND (when bound) the
+    exact URL, so neither a tab switch nor a same-tab navigation to a
+    different conversation can receive the side effect. First-bind landing
+    sends are covered by the id check as well.
+    """
+    text, structured = await call_tool(session, "list_pages")
+    pages = pages_from_result(text, structured)
+    current = next((page for page in pages if page.get("selected")), None)
+    if current is None:
+        raise RuntimeError(
+            "conversation_moved: no selected tab is visible; inspect before retry"
+        )
+    if page_id is not None and current.get("id") != page_id:
+        raise RuntimeError(
+            "conversation_moved: the selected tab changed before acting; "
+            "inspect before retry"
+        )
+    requested = args.conversation_url
+    if requested is not None and is_conversation_url(requested):
+        if canonical_conversation_url(current.get("url")) != canonical_conversation_url(requested):
+            raise RuntimeError(
+                "conversation_moved: the selected tab is no longer the exact "
+                "bound URL; inspect before retry"
+            )
+    elif requested is None or is_landing_url(requested):
+        # First-bind sends target the landing tab itself: refuse if it has
+        # navigated anywhere else (another conversation or off-site).
+        if not is_landing_url(current.get("url")):
+            raise RuntimeError(
+                "conversation_moved: the landing tab navigated away before "
+                "acting; inspect before retry"
+            )
+    return current
+
+
+async def insert_composer_text(
+    session: ClientSession,
+    page_id: int,
+    message: str,
+    composer_uid: str | None = None,
+) -> dict[str, Any]:
+    """Fill the composer through the trusted editing path.
+
+    Plain DOM fill does not fire editing events, so ProseMirror-based
+    composers keep reporting an empty editor and no send control appears.
+    select-all + execCommand('insertText') goes through the browser editing
+    engine, which the live ChatGPT UI registers (verified 2026-09-05).
+    If the trusted path cannot run, fall back to legacy fill and let the
+    send-control wait below be the arbiter; failure stays fail-closed.
+    """
+    try:
+        text, structured = await call_tool(
+            session,
+            "evaluate_script",
+            {
+                "pageId": page_id,
+                "function": composer_insert_script(message),
+                "waitForStableDom": False,
+            },
+        )
+        result = (
+            structured.get("result")
+            if isinstance(structured.get("result"), dict)
+            else parse_script_json(text)
+        )
+    except Exception:
+        result = {}
+    if result.get("ok") and result.get("matched"):
+        return result
+    if composer_uid is None:
+        raise RuntimeError(
+            "composer_fill_failed: the editor did not register the inserted "
+            "text; inspect before retry"
+        )
+    await call_tool(
+        session,
+        "fill",
+        {"pageId": page_id, "uid": composer_uid, "value": message},
+    )
+    return {"ok": True, "exec_ok": False, "fallback_fill": True}
 
 
 def server_parameters(args: argparse.Namespace) -> StdioServerParameters:
@@ -2434,6 +2597,7 @@ async def upload_operation(
     page_id = listing["page_id"]
     actual_url = page.get("url")
     validate_conversation_page(args, actual_url)
+    require_exact_page(args, actual_url)
 
     snapshot = await take_page_snapshot(session, page_id)
     before = await page_state(session, page_id, snapshot)
@@ -2444,7 +2608,8 @@ async def upload_operation(
     if not high_state_is_verified(before):
         if before.get("reasoning_controls"):
             raise RuntimeError(
-                "reasoning_state_unverified: High is visible but its selected state is not confirmed"
+                "reasoning_state_unverified: High is visible but its selected state "
+                "is not confirmed"
             )
         raise RuntimeError(
             "reasoning_state_unverified: no visible High reasoning control was found"
@@ -2470,6 +2635,7 @@ async def upload_operation(
             "file_name": filename,
         }
         try:
+            await require_selected_page(session, args, page_id)
             current_snapshot = await take_page_snapshot(session, page_id)
             target, proxy = await open_local_upload_target(
                 session, page_id, current_snapshot
@@ -2725,6 +2891,7 @@ async def send_operation(
     page_id = listing["page_id"]
     actual_url = page.get("url")
     validate_conversation_page(args, actual_url)
+    require_exact_page(args, actual_url)
 
     snapshot = await take_page_snapshot(session, page_id)
     before = await page_state(session, page_id, snapshot)
@@ -2748,7 +2915,7 @@ async def send_operation(
     if not composer:
         raise RuntimeError("page_state_unreadable: composer uid was not found in snapshot")
     draft = composer_text(composer)
-    if draft and draft.strip() != message.strip():
+    if draft and squashed(draft) != squashed(message):
         raise RuntimeError(
             "composer_not_empty: refusing to overwrite an existing unsent draft"
         )
@@ -2757,18 +2924,16 @@ async def send_operation(
             "submission_already_present: the requested text is already the latest "
             "visible user message; inspect before retry"
         )
-    if not draft:
-        await call_tool(
-            session,
-            "fill",
-            {"pageId": page_id, "uid": composer["id"], "value": message},
-        )
+    # Normalize unconditionally: empty, identical, or whitespace-identical
+    # drafts all end up editor-registered; a truly differing draft was refused.
+    await insert_composer_text(session, page_id, message, composer.get("id"))
 
     send_button, latest, latest_messages = await wait_for_send_control_or_submission(
         session, page_id, initial_messages, message
     )
     submission_observed = submission_started(initial_messages, latest_messages, message)
     if send_button and not submission_observed:
+        await require_selected_page(session, args, page_id)
         try:
             await call_tool(
                 session,
@@ -2858,11 +3023,296 @@ async def send_operation(
     )
 
 
+def require_non_empty_message_file(path: Path | None) -> str:
+    if path is None:
+        raise ValueError("send requires --message-file")
+    candidate = path.expanduser()
+    if not candidate.is_file():
+        raise FileNotFoundError(f"message file not found: {candidate}")
+    message = candidate.read_text(encoding="utf-8")
+    if not message.strip():
+        raise ValueError("send requires a non-empty message file")
+    return message
+
+
+def is_landing_url(url: str | None) -> bool:
+    return bool(url) and url.rstrip("/") in {
+        "https://chatgpt.com",
+        "https://chat.openai.com",
+    }
+
+
+def preflight_url_shape(args: argparse.Namespace) -> None:
+    """Reject empty or off-site conversation URLs before the MCP session.
+
+    A foreign URL can never match a ChatGPT tab, so failing here only moves
+    the inevitable conversation_url_unavailable earlier (and keeps it exact).
+    """
+    if args.operation not in {
+        "send",
+        "upload",
+        "status",
+        "wait",
+        "inspect",
+        "list-conversations",
+        "switch-conversation",
+        "export-conversation",
+        "download-attachments",
+        "select-model",
+        "close-duplicates",
+        "doctor",
+    }:
+        return
+    url = args.conversation_url
+    if not url:
+        return
+    if not (is_conversation_url(url) or is_landing_url(url)):
+        raise RuntimeError(
+            "conversation_url_unavailable: expected an exact ChatGPT "
+            f"conversation URL or landing page, observed {url!r}"
+        )
+
+
+def preflight_args(args: argparse.Namespace) -> None:
+    """Fail fast on caller-side errors before opening the MCP session.
+
+    Errors raised inside the session can be masked by anyio task-group
+    teardown (a BrokenResourceError replaces the original), so every check
+    that does not need the browser runs here with the same error codes the
+    operations would raise. Timeouts are required positive here so a
+    non-positive value can never report failure after side effects.
+    """
+    op = args.operation
+    preflight_url_shape(args)
+    if op == "send":
+        if not args.confirm_send:
+            raise PermissionError(
+                "send_refused: use --confirm-send only after action-time user confirmation"
+            )
+        if not args.verified_high:
+            raise PermissionError(
+                "send_refused: visibly verify High first, then pass --verified-high"
+            )
+        if not args.conversation_url and not args.new_conversation:
+            raise RuntimeError(
+                "conversation_url_unavailable: pass the exact bound URL, or "
+                "--new-conversation for the landing-page first bind"
+            )
+        require_non_empty_message_file(args.message_file)
+        if args.timeout <= 0:
+            raise ValueError(
+                "send requires a positive --timeout; a non-positive timeout "
+                "would report failure after side effects"
+            )
+        if args.auto_save_report:
+            root = require_project_control_plane(args)
+            report_path = report_output_path(args, root)
+            if report_path.exists() and not args.overwrite:
+                raise FileExistsError(
+                    f"output_exists: {report_path} already exists; pass --overwrite only after confirming replacement"
+                )
+    elif op == "select-model":
+        if not args.confirm_model:
+            raise PermissionError(
+                "model_selection_refused: use --confirm-model only after confirming the exact target page"
+            )
+        if args.conversation_url is None or not is_conversation_url(args.conversation_url):
+            raise ValueError(
+                "conversation_url_unavailable: select-model requires an exact ChatGPT conversation URL"
+            )
+        if compact_label(args.effort) not in {"high", "medium", "low", "instant", "高", "中", "低"}:
+            raise ValueError(
+                "reasoning_option_unavailable: supported effort names are High, Medium, Low, or Instant"
+            )
+    elif op == "batch-send":
+        if not args.confirm_batch:
+            raise PermissionError(
+                "batch_refused: use --confirm-batch only after confirming every exact file and destination"
+            )
+        if not args.verified_high:
+            raise PermissionError(
+                "batch_refused: visibly verify High first, then pass --verified-high"
+            )
+        if args.new_conversation:
+            raise ValueError("batch_invalid: batch-send does not allow --new-conversation")
+        if args.batch_file is None:
+            raise ValueError("batch-send requires --batch-file")
+        for item in load_batch_items(args.batch_file):
+            # Items without an explicit timeout inherit the parent --timeout,
+            # so validate the effective value: nothing may act on <= 0.
+            effective = item["timeout"] if item["timeout"] is not None else args.timeout
+            if effective <= 0:
+                raise ValueError(
+                    f"batch_invalid: item {item['index']} needs a positive effective timeout"
+                )
+            require_non_empty_message_file(item["message_file"])
+    elif op == "upload":
+        if not args.confirm_upload:
+            raise PermissionError(
+                "upload_refused: use --confirm-upload only after confirming the exact file and destination"
+            )
+        if not args.verified_high:
+            raise PermissionError(
+                "upload_refused: visibly verify High first, then pass --verified-high"
+            )
+        if not args.conversation_url and not args.new_conversation:
+            raise RuntimeError(
+                "conversation_url_unavailable: pass the exact bound URL, or "
+                "--new-conversation for the landing-page first bind"
+            )
+        normalize_upload_files(args.file)
+    elif op == "close-duplicates":
+        if not args.confirm_close:
+            raise PermissionError(
+                "close_refused: use --confirm-close only after confirming the exact conversation URL"
+            )
+        if args.conversation_url is None or not is_conversation_url(args.conversation_url):
+            raise ValueError(
+                "conversation_url_unavailable: close-duplicates requires an exact ChatGPT conversation URL"
+            )
+    elif op == "download-attachments":
+        if not args.confirm_download:
+            raise PermissionError(
+                "download_refused: use --confirm-download only after confirming the exact page and target"
+            )
+        if args.conversation_url is None or not is_conversation_url(args.conversation_url):
+            raise ValueError(
+                "conversation_url_unavailable: download-attachments requires an exact ChatGPT conversation URL"
+            )
+        if args.timeout <= 0:
+            raise ValueError("download-attachments requires a positive --timeout")
+        require_project_control_plane(args)
+    elif op == "new-page":
+        if args.navigation_timeout <= 0:
+            raise ValueError("new-page requires a positive --navigation-timeout")
+        validate_new_page_url(args.conversation_url or "https://chatgpt.com/")
+    elif op == "wait":
+        if args.conversation_url is None:
+            raise ValueError("wait requires --conversation-url")
+        if args.timeout < 0:
+            raise ValueError("wait requires a non-negative --timeout")
+
+
+def cdp_reachable(cdp_url: str | None) -> tuple[bool, str]:
+    base = (cdp_url or "").rstrip("/")
+    try:
+        with urllib.request.urlopen(base + "/json/version", timeout=5) as response:
+            info = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        return False, f"{base or '(empty CDP URL)'} unreachable: {exc}"
+    return True, str(info.get("Browser", "reachable"))
+
+
+def doctor_local_checks(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Interpreter, dependency, launcher, and CDP checks (no browser session)."""
+    checks: list[dict[str, Any]] = []
+
+    def record(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    record("python", sys.version_info >= (3, 10), sys.version.split()[0])
+    try:
+        record("mcp_sdk", True, importlib.metadata.version("mcp"))
+    except importlib.metadata.PackageNotFoundError:
+        record("mcp_sdk", False, 'missing: pip install "mcp==1.12.2" (tested)')
+    node = shutil.which("node")
+    record("node", node is not None, node or "node not in PATH")
+    launcher = args.mcp_command if args.mcp_command != "npx" else "npx"
+    launcher_detail = launcher
+    if args.mcp_package_root:
+        launcher_detail += " (package-root mode falls back to /usr/local/bin/node when node is absent from PATH)"
+    record(
+        "mcp_launcher",
+        shutil.which(launcher) is not None or Path(launcher).is_file(),
+        launcher_detail,
+    )
+    reachable, cdp_detail = cdp_reachable(args.cdp_url)
+    record("cdp", reachable, cdp_detail)
+    return checks
+
+
+async def doctor_operation(
+    session: ClientSession, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Read-only environment checklist. Never sends, uploads, or closes."""
+    checks: list[dict[str, Any]] = doctor_local_checks(args)
+
+    def record(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    try:
+        text, structured = await call_tool(session, "list_pages")
+        pages = pages_from_result(text, structured)
+    except Exception as exc:
+        record("chatgpt_tab", False, f"list_pages failed: {exc}")
+        pages = []
+    chat_pages = [page for page in pages if is_chatgpt_url(page.get("url"))] if pages else []
+    if not pages:
+        record("chatgpt_tab", False, "list_pages returned no tabs")
+    else:
+        record(
+            "chatgpt_tab",
+            bool(chat_pages),
+            f"{len(chat_pages)} ChatGPT tab(s) open"
+            if chat_pages
+            else "no ChatGPT tab open in the attached browser",
+        )
+    if args.conversation_url:
+        matches = [
+            page
+            for page in chat_pages
+            if canonical_conversation_url(page.get("url"))
+            == canonical_conversation_url(args.conversation_url)
+        ]
+        record(
+            "bound_page",
+            len(matches) == 1,
+            "exact bound page open" if len(matches) == 1 else "bound URL not open",
+        )
+        if len(matches) == 1 and isinstance(matches[0].get("id"), int):
+            try:
+                snapshot = await take_page_snapshot(session, matches[0]["id"])
+                state = await page_state(session, matches[0]["id"], snapshot)
+            except Exception as exc:
+                record("composer", False, f"page state unreadable: {exc}")
+                state = {}
+            if state:
+                record("composer", bool(state.get("has_composer")), "")
+                record(
+                    "high_control",
+                    bool(state.get("reasoning_controls")),
+                    "High control visible" if state.get("reasoning_controls") else "no reasoning control visible",
+                )
+    failed = sum(1 for item in checks if not item["ok"])
+    return {
+        "operation": "doctor",
+        "checks": checks,
+        "passed_count": len(checks) - failed,
+        "failed_count": failed,
+    }
+
+
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.operation == "save-report":
         return save_report_operation(args)
+    if args.operation == "doctor" and not _MCP_SDK_AVAILABLE:
+        checks = doctor_local_checks(args)
+        failed = sum(1 for item in checks if not item["ok"])
+        return {
+            "operation": "doctor",
+            "checks": checks,
+            "passed_count": len(checks) - failed,
+            "failed_count": failed,
+            "mcp_session": "skipped: MCP SDK missing",
+        }
+    if not _MCP_SDK_AVAILABLE:
+        raise RuntimeError(
+            'mcp_sdk_missing: the MCP Python SDK is not installed; run pip install "mcp==1.12.2" '
+            "with the interpreter launching bridge.py"
+        )
     if not args.mcp_python.expanduser().is_file():
         raise FileNotFoundError(f"MCP Python executable not found: {args.mcp_python}")
+    preflight_args(args)
     params = server_parameters(args)
 
     async def list_roots_callback(_context: Any) -> ListRootsResult:
@@ -2898,6 +3348,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 ) from exc
             if args.operation == "inspect":
                 return await inspect_operation(session, args.conversation_url)
+            if args.operation == "doctor":
+                return await doctor_operation(session, args)
             if args.operation == "new-page":
                 return await new_page_operation(
                     session, args.conversation_url, args.navigation_timeout
@@ -2947,15 +3399,56 @@ def main() -> int:
     return 0 if operation_ok else 2
 
 
+_WRAPPER_MESSAGE_PATTERNS = (
+    "unhandled errors in a TaskGroup",
+    re.compile(r"\(\d+ sub-exceptions?\)"),
+)
+
+
+def _is_wrapper_message(message: str) -> bool:
+    for pattern in _WRAPPER_MESSAGE_PATTERNS:
+        if isinstance(pattern, str):
+            if pattern in message:
+                return True
+        elif pattern.search(message):
+            return True
+    return False
+
+
 def error_message(exc: Exception) -> str:
-    """Keep MCP task-group failures readable without dumping nested traces."""
-    nested = getattr(exc, "exceptions", None)
-    if nested:
-        for child in nested:
-            message = error_message(child)
-            if message:
-                return message
-    return str(exc)
+    """Keep MCP task-group failures readable without dumping nested traces.
+
+    Walks nested groups plus __cause__/__context__ chains and returns the
+    first meaningful message, skipping empty teardown noise (e.g. anyio
+    BrokenResourceError that replaces the original error on session exit).
+    """
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    fallback = ""
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        nested = getattr(current, "exceptions", None)
+        cause = getattr(current, "__cause__", None)
+        context = getattr(current, "__context__", None)
+        # LIFO order: nested children first, then cause, then context.
+        if context is not None and context is not current and context is not cause:
+            stack.append(context)
+        if cause is not None and cause is not current:
+            stack.append(cause)
+        if nested:
+            stack.extend(reversed(list(nested)))
+        message = str(current)
+        if not message:
+            continue
+        if _is_wrapper_message(message):
+            if not fallback:
+                fallback = message
+            continue
+        return message
+    return fallback or str(exc)
 
 
 if __name__ == "__main__":
