@@ -1,13 +1,35 @@
-# chatgpt-bridge-skill
+# ChatGPT Bridge
 
-Out-of-the-box, dual-compatible (opencode + codex) skill that delegates bounded,
-source-grounded research to your signed-in ChatGPT Web through an attach-only
-Chrome CDP bridge. No API keys, no cookies handling, no second browser controller.
+`chatgpt-web-bridge` is the public repository for the `chatgpt-bridge`
+OpenCode/Codex skill: delegate bounded, source-grounded research to your
+signed-in ChatGPT Web through an attach-only Chrome CDP bridge.
+No API keys, no cookies handling, no second browser controller.
+
+> Status: **pre-1.0 release candidate** (`BRIDGE_VERSION`, see CHANGELOG.md).
+> Not yet recommended as v1.0.
 
 - Skill: `skills/chatgpt-bridge/SKILL.md` (canonical trigger: `$chatgpt-bridge`, legacy alias: `$chatgpt-web-research`)
-- Bridge: `skills/chatgpt-bridge/scripts/bridge.py` (spawns pinned `chrome-devtools-mcp@1.8.0` with `--browserUrl`, never launches/closes your Chrome)
+- Bridge: `skills/chatgpt-bridge/scripts/bridge.py` (spawns pinned `chrome-devtools-mcp@1.8.0` with `--browserUrl`, never launches/terminates your Chrome process)
+- Architecture map: `skills/chatgpt-bridge/references/architecture.md`
 - Codex surface: `skills/chatgpt-bridge/agents/openai.yaml`
 - Env docs: `skills/chatgpt-bridge/references/env.md`
+
+When it works, the flow is always:
+
+1. `doctor` passes (interpreter, deps, CDP, tabs);
+2. the exact ChatGPT tab is selected (never guessed);
+3. model/reasoning is verified (GPT-5.6 Sol + High);
+4. the brief file is sent from `--message-file`;
+5. the exact conversation URL is returned for reuse.
+
+| Tested stack | Version |
+|---|---|
+| Python | 3.13.5 (requires 3.10+) |
+| `mcp` SDK | 1.12.2 (v2 compat unverified) |
+| `websockets` | ≥15.0.1 (download-attachments only) |
+| Node.js | 24.15.0 (requires ^20.19 / ^22.12 / ≥23) |
+| `chrome-devtools-mcp` | 1.8.0 (pinned) |
+| Chrome | 152 (dedicated automation profile) |
 
 ## Prerequisites
 
@@ -26,8 +48,11 @@ Chrome CDP bridge. No API keys, no cookies handling, no second browser controlle
    & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.chrome-chatgpt-bridge"
    ```
 2. `npx` (Node.js) in `PATH`.
-3. Python 3.10+ with the tested SDK: `pip install "mcp==1.12.2" "websockets>=15.0.1"`
-   (MCP Python SDK v2 compatibility is unverified).
+3. Python 3.10+ with the tested dependencies (see `requirements.txt`):
+   ```sh
+   python -m pip install -r requirements.txt
+   ```
+   (`mcp==1.12.2`, `websockets>=15.0.1`; SDK v2 compatibility is unverified).
 4. A ChatGPT account/workspace whose picker actually exposes the requested
    GPT-5.6 Sol + High state — otherwise the model gate will (correctly) refuse.
 5. That's it. No `.env`, no tokens.

@@ -32,7 +32,8 @@ Legacy alias: `$chatgpt-web-research`. New canonical trigger is `$chatgpt-bridge
    & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.chrome-chatgpt-bridge"
    ```
 2. Node.js with `npx` in `PATH`.
-3. Python 3.10+ with the tested SDK: `pip install "mcp==1.12.2" "websockets>=15.0.1"`
+3. Python 3.10+ with the tested dependencies (`requirements.txt` at the repo
+   root): `python -m pip install -r requirements.txt`.
    (MCP SDK v2 compatibility unverified).
 4. A ChatGPT account/workspace whose picker actually exposes GPT-5.6 Sol +
    High — otherwise the model gate will (correctly) refuse.

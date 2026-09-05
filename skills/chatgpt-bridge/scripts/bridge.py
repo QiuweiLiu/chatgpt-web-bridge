@@ -37,6 +37,8 @@ except ImportError:
     _MCP_SDK_AVAILABLE = False
 
 
+BRIDGE_VERSION = "0.9.0"
+
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 DEFAULT_MCP_PACKAGE = "chrome-devtools-mcp@1.8.0"
 MCP_CALL_TIMEOUT_SECONDS = 30
@@ -59,6 +61,11 @@ DEFAULT_MCP_PYTHON = Path(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Use Chrome DevTools MCP without automatic browser launch or message submission."
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {BRIDGE_VERSION}",
     )
     parser.add_argument(
         "operation",
@@ -3316,6 +3323,7 @@ def doctor_local_checks(args: argparse.Namespace) -> list[dict[str, Any]]:
     def record(name: str, ok: bool, detail: str = "") -> None:
         checks.append({"name": name, "ok": bool(ok), "detail": detail})
 
+    record("bridge_version", True, BRIDGE_VERSION)
     record("python", sys.version_info >= (3, 10), sys.version.split()[0])
     try:
         record("mcp_sdk", True, importlib.metadata.version("mcp"))
